@@ -12,7 +12,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot
-from book_detector import BookDetection, detect_book
+from book_detector import BookDetection, detect_book, _hough_orientation
 from image_config import ImageConfig
 from pipeline import process_bgr
 from shadow_removal import reduce_soft_shadows
@@ -47,6 +47,17 @@ class ConfigTests(unittest.TestCase):
 
 
 class GeometryTests(unittest.TestCase):
+    def test_hough_array_layouts_from_different_opencv_versions(self):
+        edges = np.zeros((200, 200), np.uint8)
+        quad = np.array([[30, 30], [170, 30], [170, 170], [30, 170]], np.float32)
+        line = np.array([[30, 30, 170, 30]], np.int32)
+        with patch('book_detector.cv2.HoughLinesP', return_value=line):
+            flat = _hough_orientation(edges, quad)
+        with patch('book_detector.cv2.HoughLinesP', return_value=line.reshape(-1, 1, 4)):
+            nested = _hough_orientation(edges, quad)
+        self.assertEqual(flat, nested)
+        self.assertEqual(flat, 0.0)
+
     def test_deskew_rotated_book(self):
         image = synthetic_book([(245, 95), (540, 150), (515, 565), (220, 510)])
         result = process_bgr(image, (10, 10, 10, 10), ImageConfig(shadow_enabled=False))
