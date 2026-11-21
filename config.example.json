@@ -1,0 +1,22 @@
+{
+  "TELEGRAM_BOT_TOKEN": "PASTE_TOKEN_HERE",
+  "ALLOWED_USER_IDS": "YOUR_TELEGRAM_ID",
+  "IMAGE_PROCESSING": {
+    "enabled": true,
+    "deskew_enabled": true,
+    "perspective_enabled": true,
+    "shadow_enabled": true,
+    "rotation_only": false,
+    "analysis_max_side": 1400,
+    "min_confidence": 0.78,
+    "min_book_area": 0.07,
+    "max_book_area": 0.91,
+    "max_deskew_degrees": 18.0,
+    "perspective_threshold": 0.075,
+    "max_perspective_stretch": 1.35,
+    "shadow_strength": 0.35,
+    "shadow_min_variation": 12.0,
+    "shadow_clahe_clip": 0.0,
+    "debug_dir": null
+  }
+}
