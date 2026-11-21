@@ -4,19 +4,24 @@
   "IMAGE_PROCESSING": {
     "enabled": true,
     "deskew_enabled": true,
-    "perspective_enabled": true,
+    "perspective_enabled": false,
     "shadow_enabled": true,
-    "rotation_only": false,
+    "rotation_only": true,
     "analysis_max_side": 1400,
     "min_confidence": 0.78,
     "min_book_area": 0.07,
     "max_book_area": 0.91,
-    "max_deskew_degrees": 18.0,
+    "max_deskew_degrees": 18,
     "perspective_threshold": 0.075,
     "max_perspective_stretch": 1.35,
-    "shadow_strength": 0.35,
-    "shadow_min_variation": 12.0,
-    "shadow_clahe_clip": 0.0,
-    "debug_dir": null
-  }
+    "shadow_strength": 0.45,
+    "shadow_min_variation": 12,
+    "shadow_clahe_clip": 0,
+    "debug_dir": null,
+    "line_deskew_enabled": true,
+    "max_line_deskew_degrees": 6,
+    "contrast_enabled": true,
+    "contrast_strength": 0.22
+  },
+  "flush_updates_on_start": true
 }

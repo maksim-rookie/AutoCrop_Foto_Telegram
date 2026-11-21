@@ -1,123 +1,56 @@
-# AutoCrop Telegram — optional CV enhancements (v1.2)
+# AutoCrop Telegram v1.3.0 — CV pipeline
 
-Runs without ML models; dependencies remain OpenCV, NumPy, Pillow. The original v1.1 `crop_core.py` is **not modified**. Existing Telegram API, commands, `/padding` semantics, file size limits, EXIF behavior, access control and startup remain supported.
+Зависимости: OpenCV, NumPy, Pillow; без тяжёлых моделей ML. Бот использует urllib/Telegram Bot API с long polling, сохраняет существующие команды и `ALLOWED_USER_IDS`. EXIF учитывается до обработки. RGBA и 16-bit используют старую ветку, чтобы не потерять прозрачность и глубину цвета.
 
-## Architecture
+## Этапы и fallback
+1. `crop.py` / `crop_core.py` — исходный AutoCrop с прежними отступами.
+2. `book_detector.py` + `deskew.py` — необязательное определение четырёхугольника и небольшой deskew, с порогом confidence. Для раскрытых книг без четырёхугольника поиск **двух** длинных согласованных почти горизонтальных границ; поворот до 6°, без растяжения.
+3. `shadow_removal.py` — мягкое ограниченное выравнивание яркости светлых низконасыщенных областей.
+4. `contrast.py` — очень лёгкое усиление деталей текста только по L (LAB), маска бумаги, без глобального контраста RGB.
+5. `pipeline.py` — независимые feature flags и fallback. **Тени и контраст применяются также при `confidence=0` и безопасной обычной обрезке.**
+6. `bot.py` — отдельная опция очистки накопленных Telegram updates после перезапуска.
 
-- `bot.py`: validated Telegram input, EXIF orientation, output encoding, configuration and command routing.
-- `image_config.py`: typed and range-validated CV settings with conservative defaults.
-- `book_detector.py`: RGB downscaling for analysis (full-size output), Canny on lightness/chroma, morphological closing, convex contours, 4-corner approximation, geometric `minAreaRect` fallback, HoughLinesP angle cross-check and confidence/reason diagnostics.
-- `deskew.py`: bounded affine rotation or quadrilateral rectification, both with a margin around all corners. If the required stretch is excessive, the warp is rejected.
-- `shadow_removal.py`: limited illumination-field division, light/low-saturation masks, morphology, optional gentle CLAHE. No hard whitening and no recovery of saturated glare.
-- `crop.py`: original AutoCrop wrapper for safe fallback.
-- `pipeline.py`: feature flags, fallback handling, logging and opt-in debug snapshots.
-
-**Safety:** Uncertain detections use legacy crop (or the exact original file if no crop is needed). 16-bit or alpha-bearing input retains the legacy path instead of a destructive 8-bit conversion. CV analysis uses RGB; the output is encoded using the original file format rules. EXIF is applied *before* analysis. Setting `enabled: false` invokes only the old algorithm. No new Telegram commands are introduced.
-
-## Configuration
-
-Copy `config.example.json` to `config.json` and set the Telegram token/IDs as in v1.1. In `IMAGE_PROCESSING`:
-
-| Setting | Default | Meaning |
+## Основные настройки (в `config.example.json`)
+| Параметр | Значение по умолчанию | Назначение |
 |---|---:|---|
-| `enabled` | `true` | Master feature flag: `false` = v1.1 behavior |
-| `deskew_enabled` | `true` | Correct small tilt when book contour is certain |
-| `perspective_enabled` | `true` | Warp only sufficiently nonparallel book edges |
-| `shadow_enabled` | `true` | Neutral-surface soft shadow reduction |
-| `rotation_only` | `false` | Manual mode: never use perspective warp |
-| `analysis_max_side` | `1400` | Long side for detection; full output resolution retained |
-| `min_confidence` | `0.78` | Confidence gate for all enhancements |
-| `min_book_area`, `max_book_area` | `0.07`, `0.91` | Reject tiny or frame-filling candidates |
-| `max_deskew_degrees` | `18.0` | Prevent accidental 90° or large rotations |
-| `perspective_threshold` | `0.075` | Required side disparity before perspective is attempted |
-| `max_perspective_stretch` | `1.35` | Maximum unequal opposite-edge length ratio |
-| `shadow_strength` | `0.35` | `0` disables effect; recommended `0.2–0.5` |
-| `shadow_min_variation` | `12.0` | Ignore effectively uniform illumination |
-| `shadow_clahe_clip` | `0.0` | Optional mild CLAHE, recommended off for cover color |
-| `debug_dir` | `null` | Folder for debug masks, quadrilateral overlay, angle JSON and output |
+| `IMAGE_PROCESSING.enabled` | true | false = исходное кадрирование v1.1 |
+| `deskew_enabled` | true | мягкое выравнивание горизонта |
+| `line_deskew_enabled` | true | fallback по границам раскрытых страниц |
+| `max_line_deskew_degrees` | 6.0 | максимум линейного поворота |
+| `perspective_enabled` | **false** | projective warp выключен |
+| `rotation_only` | **true** | нет перспективы даже при уверенном контуре |
+| `min_confidence` | 0.78 | порог **только геометрии**, не теней |
+| `shadow_enabled` | true | ограниченная коррекция мягких теней |
+| `shadow_strength` | 0.45 | сила коррекции (0..1) |
+| `contrast_enabled` | true | лёгкое усиление читаемости |
+| `contrast_strength` | 0.22 | сила контраста (0..1) |
+| `analysis_max_side` | 1400 | уменьшенная копия для детекции |
+| `debug_dir` | null | маски/изображения только при явном включении |
+| `flush_updates_on_start` | **true** | верхний ключ JSON: очищать очередь при запуске |
 
-`debug_dir` is **opt-in**: diagnostics may contain users' photographs. Use a private writable folder, remove the snapshots after debugging and never commit them to GitHub. Token and Telegram IDs are never stored in diagnostics.
+Перспектива доступна только при явной настройке `perspective_enabled=true` **и** `rotation_only=false`; на предоставленных фото раскрытых книг она не рекомендована.
 
-## Run and test
+## Очистка очереди Telegram
+При `flush_updates_on_start=true` бот вызывает `getUpdates(offset=-1, limit=1, timeout=0)` и продолжает с `last_update_id+1`. Это **намеренно пропускает** все накопившиеся при остановке обновления, не удаляя сообщения из диалога. Отключение: `false`.
 
+В `ALLOWED_USER_IDS` можно записать несколько числовых ID через запятую. Переменная окружения `ALLOWED_USER_IDS` имеет приоритет над JSON; в логах есть только число допущенных пользователей и allowed/denied, без публикации ID и токенов.
+
+## Запуск и тесты
 ```powershell
 py -3.12 -m pip install -r requirements.txt
 py -3.12 -m unittest discover -s tests -v
-py -3.12 bot.py
+py -3.12 scripts/process_local.py "sample.jpg" "out.jpg"
+py -3.12 scripts/benchmark_cv.py
 ```
 
-No Telegram connection is needed for unit tests. Smoke-test the image processing logic independently:
+Синтетические тесты не используют Telegram. Локально 51 тест успешен; повторить на Windows и на реальных фотографиях до эксплуатации. Приватные изображения не добавляйте в публичный репозиторий.
 
-```powershell
-py -3.12 scripts/process_local.py "sample.jpg" "sample_cropped.jpg"
-py -3.12 scripts/process_local.py "sample.jpgNo readable content was found in this file for the requested mode.ваются до кадрирования.
-При отсутствии обрезки и преобразования ориентации возвращаются исходные байты.
-При повторном кодировании метаданные EXIF/ICC не переносятся.
-Обычные фото Telegram может сжимать ещё до получения ботом.
-Результат ограничен 49 MB; при превышении бот попросит меньший исходник.
+## Риски
+- Блики, старые пожелтевшие страницы, серьёзные локальные тени и кривизну переплёта нельзя исправить идеально стандартным CV.
+- Выравнивание по двум границам остаётся эвристическим; можно отключить `deskew_enabled=false`.
+- Изменённые файлы могут потерять EXIF/ICC исходных фотографий (как и в v1.1).
+- Debug snapshots могут сохранять частные фотографии, каталог должен быть приватным и удаляемым.
+- Очередь при перезапуске **теряется** при включённом флаге.
+- Производительность 3–5 с на целевом компьютере и реальный Telegram ещё подлежат испытаниям.
 
-РАБОТА И ЗАПУСК НА СЕРВЕРЕ
-
-Бот работает, пока запущен bot.py и компьютер подключён к интернету.
-Закрытая консоль, выключенный компьютер или спящий режим остановят обработку.
-Для работы 24/7 перенесите папку на постоянно включённый ПК или VPS.
-Отдельный домен, публичный IP и входящие порты не нужны: используется long polling.
-Нужен исходящий HTTPS к api.telegram.org и доступ к PyPI для установки.
-
-Linux/macOS:
-  python3 -m venv .venv
-  .venv/bin/python -m pip install -r requirements.txt
-  .venv/bin/python bot.py
-
-Можно задать TELEGRAM_BOT_TOKEN и ALLOWED_USER_IDS в переменных среды
-вместо config.json. Переменные среды имеют приоритет.
-Для постоянного сервера задайте автозапуск через systemd/диспетчер служб.
-Сам этот комплект не настраивает сервер и не регистрирует службу.
-Файлы обрабатываются в оперативной памяти без сохранения локальных копий.
-Загрузка и ответы проходят через Telegram и остаются в чате по его правилам.
-Обработка последовательная, рассчитана на личное использование/небольшую команду.
-Настройки и offset хранятся в памяти: после аварии возможен повтор последнего ответа.
-После ошибки отправки пришлите изображение повторно.
-
-ЕСЛИ НЕ РАБОТАЕТ
-
-Версия комплекта 1.1: подробная диагностика запуска без вывода токена.
-Теперь отдельно сообщаются ошибки JSON (строка/столбец), неправильные
-поля конфигурации, config.json.txt, отказ API, DNS, TLS и тайм-ауты.
-Для обновления с 1.0 достаточно заменить bot.py; свой config.json сохраните.
-Если ошибка осталась, передайте текст нового сообщения, без токена.
-
-401/404: проверьте токен. При утечке отзовите его через @BotFather.
-409: остановите другие копии этого бота.
-Webhook: используйте отдельного бота или самостоятельно отключите прежний webhook.
-Комплект проверяет webhook и не отключает его автоматически.
-Нет доступа: проверьте ALLOWED_USER_IDS и перезапустите бота.
-Нет подключения: проверьте доступ к api.telegram.org на вашем ПК/сервере.
-Ошибка установки: проверьте версию Python, интернет и вывод pip в консоли.
-
-ПРОВЕРКИ И СОСТАВ
-
-crop_core.py — алгоритм из исходного auto_crop.py, без Tkinter.
-bot.py — Telegram Bot API, контроль доступа и обработка в памяти.
-start_windows.bat — создание среды, установка зависимостей и запуск.
-config.example.json — образец, не содержит настоящего токена.
-tests/test_bot.py — автоматические проверки с подменой Telegram API.
-
-Запуск проверок:
-  python -m unittest discover -s tests -v
-
-Проверено в Linux с Python 3.12, NumPy 2.5.4, OpenCV 5.0.0, Pillow 13.0.0.
-Проверки не подключаются к Telegram. Живой обмен с ботом и запуск .bat на Windows
-в этой среде не проверены — для этого нужен ваш токен и ваш компьютер.
-
-Документация Telegram: https://core.telegram.org/bots/api
-
-НОВОЕ В ПАТЧЕ v1.2 CV
-
-Новые модули обнаруживают четырёхугольник книги, выполняют осторожное
-выравнивание наклона и перспективы, ослабляют мягкие тени. При низкой
-уверенности применяется старый crop_core.py или возвращается исходник.
-Функции включаются флагами IMAGE_PROCESSING в config.json. Чтобы полностью
-вернуть поведение v1.1, укажите "enabled": false; для режима только
-поворота — "rotation_only": true. Команды бота не менялись.
-Смотрите README_CV.md: параметры, диагностика, тесты, ограничения и риски.
+См. [CHANGELOG.md](CHANGELOG.md) и [docs/ENGINEERING_REVIEW.md](docs/ENGINEERING_REVIEW.md).

@@ -18,7 +18,8 @@ import numpy as np
 
 from book_detector import BookDetection, detect_book
 from crop import legacy_crop
-from deskew import deskew_crop, perspective_warp
+from deskew import deskew_crop, perspective_warp, estimate_page_line_angle, rotate_keep_all
+from contrast import enhance_page_contrast
 from image_config import ImageConfig
 from shadow_removal import reduce_soft_shadows
 
@@ -45,102 +46,117 @@ def _snapshot(folder: Path | None, request: str, stage: str, image: np.ndarray) 
 
 
 def process_bgr(image: np.ndarray, padding: Sequence[float], config: ImageConfig) -> PipelineResult:
-    """Process decoded, EXIF-corrected BGR image; no I/O unless debug_dir set.
-
-    The historical crop is the only operation performed when detection is weak.
-    """
+    """Safe crop with geometry-independent shadow and contrast processing."""
     start = time.perf_counter()
     folder = Path(config.debug_dir) if config.debug_dir else None
     request = uuid.uuid4().hex[:12]
-    result: PipelineResult
     if not config.enabled or image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
         cropped, reason = legacy_crop(image, padding)
-        result = PipelineResult(cropped, reason, 0, 'legacy', 'unsupported image type or disabled')
-    else:
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        detection: BookDetection
-        try:
-            detection, edges = detect_book(rgb, config)
-        except (cv2.error, ValueError, ArithmeticError) as exc:
-            LOGGER.warning('Geometric detector failed safely: %s', type(exc).__name__)
-            cropped, reason = legacy_crop(image, padding)
-            return _finish(PipelineResult(cropped, reason, 0.0, 'legacy',
-                                          'ошибка детектора; обычная обрезка'), image, folder, request, start)
-        LOGGER.info('CV detector method=%s confidence=%.3f angle_deg=%.2f perspective=%.3f reasons=%s',
-                    detection.method, detection.confidence, detection.angle_degrees,
-                    detection.perspective_strength, ', '.join(detection.reasons) or '-')
-        _snapshot(folder, request, 'canny', edges)
-        if folder is not None:
-            try:
-                folder.mkdir(parents=True, exist_ok=True)
-                (folder / f'{request}_metrics.json').write_text(json.dumps({
-                    'method': detection.method,
-                    'confidence': detection.confidence,
-                    'angle_degrees': detection.angle_degrees,
-                    'perspective_strength': detection.perspective_strength,
-                    'fallback_reasons': list(detection.reasons),
-                    'corners': detection.corners.tolist() if detection.corners is not None else None,
-                }, ensure_ascii=False, indent=2), encoding='utf-8')
-            except OSError:
-                LOGGER.warning('Could not store CV debug metrics')
-        if detection.corners is not None:
-            annotated = image.copy()
-            cv2.polylines(annotated, [np.rint(detection.corners).astype(np.int32)], True, (0, 255, 0), 3)
-            _snapshot(folder, request, 'quad', annotated)
-        if detection.corners is None or detection.confidence < config.min_confidence:
-            cropped, reason = legacy_crop(image, padding)
-            fallback = ', '.join(detection.reasons) or 'неуверенная детекция'
-            result = PipelineResult(cropped, reason, detection.confidence, 'legacy', fallback)
-        else:
-            corrected = None
-            mode = 'legacy'
-            rejected: list[str] = []
-            if config.perspective_enabled and not config.rotation_only and detection.perspective_strength >= config.perspective_threshold:
-                try:
-                    corrected = perspective_warp(image, detection, padding, config)
-                except (cv2.error, ValueError, ArithmeticError) as exc:
-                    LOGGER.warning('Perspective warp failed safely: %s', type(exc).__name__)
-                    rejected.append('perspective: ошибка вычисления')
-                if corrected is not None:
-                    mode = 'perspective'
-                else:
-                    rejected.append('перспектива отклонена: риск растяжения')
-            if corrected is None and config.deskew_enabled:
-                try:
-                    corrected = deskew_crop(image, detection, padding, config)
-                except (cv2.error, ValueError, ArithmeticError) as exc:
-                    LOGGER.warning('Deskew failed safely: %s', type(exc).__name__)
-                    rejected.append('deskew: ошибка вычисления')
-                if corrected is not None:
-                    mode = 'deskew'
-                elif abs(detection.angle_degrees) > config.max_deskew_degrees:
-                    rejected.append('поворот отклонён: превышен лимит угла')
-            if corrected is None:
-                corrected, reason = legacy_crop(image, padding)
-                if corrected is None:
-                    # No changes: original bytes must remain identical.
-                    result = PipelineResult(None, reason, detection.confidence, 'legacy',
-                                            '; '.join(rejected) if rejected else None)
-                else:
-                    result = PipelineResult(corrected, reason, detection.confidence, 'legacy',
-                                            '; '.join(rejected) if rejected else None)
-            else:
-                result = PipelineResult(corrected, 'геометрия скорректирована', detection.confidence,
-                                        mode, '; '.join(rejected) if rejected else None)
-            # Shadow removal only on a confidently detected book and a real output.
-            if result.image is not None and config.shadow_enabled and config.shadow_strength > 0:
-                try:
-                    output_rgb, gain = reduce_soft_shadows(cv2.cvtColor(result.image, cv2.COLOR_BGR2RGB), config)
-                except (cv2.error, ValueError, ArithmeticError) as exc:
-                    LOGGER.warning('Shadow correction skipped safely: %s', type(exc).__name__)
-                    output_rgb, gain = None, None
-                if gain is not None:
-                    _snapshot(folder, request, 'shadow_gain', gain)
-                    updated = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
-                    result = PipelineResult(updated, result.reason + '; мягкие тени ослаблены',
-                                            result.confidence, result.mode, result.fallback_reason)
-    return _finish(result, image, folder, request, start)
+        return _finish(PipelineResult(cropped, reason, 0.0, 'legacy',
+                        'unsupported image type or disabled'), image, folder, request, start)
 
+    cropped = None
+    reason = ''
+    mode = 'legacy'
+    confidence = 0.0
+    fallback: list[str] = []
+    detection = None
+    if config.deskew_enabled or (config.perspective_enabled and not config.rotation_only):
+        try:
+            detection, edges = detect_book(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), config)
+            confidence = detection.confidence
+            _snapshot(folder, request, 'canny', edges)
+            LOGGER.info('CV detector method=%s confidence=%.3f angle_deg=%.2f reasons=%s',
+                        detection.method, confidence, detection.angle_degrees,
+                        ', '.join(detection.reasons) or '-')
+            if folder is not None:
+                try:
+                    folder.mkdir(parents=True, exist_ok=True)
+                    (folder / f'{request}_metrics.json').write_text(json.dumps({
+                        'method': detection.method,
+                        'confidence': confidence,
+                        'angle_degrees': detection.angle_degrees,
+                        'perspective_strength': detection.perspective_strength,
+                        'fallback_reasons': list(detection.reasons),
+                        'corners': detection.corners.tolist() if detection.corners is not None else None
+                    }, ensure_ascii=False, indent=2), encoding='utf-8')
+                except OSError:
+                    LOGGER.warning('Could not store CV debug metrics')
+            if detection.corners is not None:
+                overlay = image.copy()
+                cv2.polylines(overlay, [np.rint(detection.corners).astype(np.int32)],
+                              True, (0, 255, 0), 3)
+                _snapshot(folder, request, 'quad', overlay)
+        except (cv2.error, ValueError, ArithmeticError) as exc:
+            LOGGER.warning('CV detector failed safely: %s', type(exc).__name__)
+            fallback.append('ошибка детектора; обычная обрезка')
+
+    if detection is not None and detection.corners is not None and confidence >= config.min_confidence:
+        if (config.perspective_enabled and not config.rotation_only and
+                detection.perspective_strength >= config.perspective_threshold):
+            try:
+                cropped = perspective_warp(image, detection, padding, config)
+            except (cv2.error, ValueError, ArithmeticError) as exc:
+                LOGGER.warning('Perspective skipped: %s', type(exc).__name__)
+                fallback.append('perspective: ошибка вычисления')
+            if cropped is not None:
+                reason = 'перспектива скорректирована'
+                mode = 'perspective'
+            else:
+                fallback.append('перспектива отклонена: риск растяжения')
+        if cropped is None and config.deskew_enabled:
+            try:
+                cropped = deskew_crop(image, detection, padding, config)
+            except (cv2.error, ValueError, ArithmeticError) as exc:
+                LOGGER.warning('Deskew skipped: %s', type(exc).__name__)
+                fallback.append('deskew: ошибка вычисления')
+            if cropped is not None:
+                reason = 'поворот скорректирован'
+                mode = 'deskew'
+            elif abs(detection.angle_degrees) > config.max_deskew_degrees:
+                fallback.append('поворот отклонён: превышен лимит угла')
+    elif detection is not None:
+        fallback.append(', '.join(detection.reasons) or 'неуверенная геометрия')
+
+    if cropped is None:
+        cropped, reason = legacy_crop(image, padding)
+        if (config.deskew_enabled and config.line_deskew_enabled and
+                (detection is None or detection.corners is None or confidence < config.min_confidence)):
+            try:
+                candidate = cropped if cropped is not None else image
+                angle = estimate_page_line_angle(candidate, config)
+                if angle is not None:
+                    cropped = rotate_keep_all(candidate, angle)
+                    reason += '; небольшой поворот по границам страниц'
+                    mode = 'line_deskew'
+                    LOGGER.info('Page-line deskew angle_deg=%.2f', angle)
+            except (cv2.error, ValueError, ArithmeticError) as exc:
+                LOGGER.warning('Page-line rotation skipped: %s', type(exc).__name__)
+
+    working = cropped if cropped is not None else image
+    # Importantly, lighting is independent of quadrilateral confidence/fallback.
+    if config.shadow_enabled and config.shadow_strength > 0:
+        try:
+            output_rgb, gain = reduce_soft_shadows(cv2.cvtColor(working, cv2.COLOR_BGR2RGB), config)
+            if gain is not None:
+                _snapshot(folder, request, 'shadow_gain', gain)
+                working = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+                cropped = working
+                reason += '; мягкие тени ослаблены'
+        except (cv2.error, ValueError, ArithmeticError) as exc:
+            LOGGER.warning('Shadow correction skipped: %s', type(exc).__name__)
+    if config.contrast_enabled and config.contrast_strength > 0:
+        try:
+            output_rgb, mask = enhance_page_contrast(cv2.cvtColor(working, cv2.COLOR_BGR2RGB), config)
+            if mask is not None:
+                _snapshot(folder, request, 'contrast_mask', mask)
+                working = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+                cropped = working
+                reason += '; контраст текста слегка усилен'
+        except (cv2.error, ValueError, ArithmeticError) as exc:
+            LOGGER.warning('Contrast correction skipped: %s', type(exc).__name__)
+    return _finish(PipelineResult(cropped, reason, confidence, mode,
+                                   '; '.join(fallback) or None), image, folder, request, start)
 
 def _finish(result: PipelineResult, original: np.ndarray, folder: Path | None,
             request: str, start: float) -> PipelineResult:

@@ -72,18 +72,18 @@ class GeometryTests(unittest.TestCase):
 
     def test_perspective_is_conditional(self):
         image = synthetic_book([(200, 120), (610, 95), (555, 510), (230, 535)])
-        enabled = ImageConfig(shadow_enabled=False)
+        enabled = ImageConfig(shadow_enabled=False, contrast_enabled=False, perspective_enabled=True, rotation_only=False)
         result = process_bgr(image, (5, 5, 5, 5), enabled)
         self.assertEqual(result.mode, 'perspective')
         self.assertLess(result.image.shape[1], image.shape[1])
         self.assertGreaterEqual(result.confidence, enabled.min_confidence)
         # Manual mode must not apply a projective transform, even for same input.
-        rotation = process_bgr(image, (5,) * 4, ImageConfig(shadow_enabled=False, rotation_only=True))
+        rotation = process_bgr(image, (5,) * 4, ImageConfig(shadow_enabled=False, contrast_enabled=False, rotation_only=True))
         self.assertNotEqual(rotation.mode, 'perspective')
 
     def test_stretch_guard_never_forces_perspective(self):
         image = synthetic_book([(200, 120), (610, 95), (555, 510), (230, 535)])
-        setting = ImageConfig(shadow_enabled=False, max_perspective_stretch=1.05)
+        setting = ImageConfig(shadow_enabled=False, contrast_enabled=False, perspective_enabled=True, rotation_only=False, max_perspective_stretch=1.05)
         result = process_bgr(image, (5,) * 4, setting)
         self.assertNotEqual(result.mode, 'perspective')
         self.assertIn('перспектива отклонена', result.fallback_reason or '')
@@ -92,7 +92,7 @@ class GeometryTests(unittest.TestCase):
         image = synthetic_book([(240, 110), (580, 110), (580, 520), (240, 520)])
         fake = BookDetection(None, 0.0, 'none', ('нет контура',))
         with patch('pipeline.detect_book', return_value=(fake, np.zeros(image.shape[:2], np.uint8))):
-            actual = process_bgr(image, (10,) * 4, ImageConfig())
+            actual = process_bgr(image, (10,) * 4, ImageConfig(shadow_enabled=False, contrast_enabled=False, line_deskew_enabled=False))
         expected = process_bgr(image, (10,) * 4, ImageConfig(enabled=False))
         np.testing.assert_array_equal(actual.image, expected.image)
         self.assertEqual(actual.mode, 'legacy')
@@ -101,7 +101,7 @@ class GeometryTests(unittest.TestCase):
     def test_detector_exception_does_not_destroy_image(self):
         image = synthetic_book([(240, 110), (580, 110), (580, 520), (240, 520)])
         with patch('pipeline.detect_book', side_effect=cv2.error('synthetic failure')):
-            actual = process_bgr(image, (10,) * 4, ImageConfig())
+            actual = process_bgr(image, (10,) * 4, ImageConfig(shadow_enabled=False, contrast_enabled=False, line_deskew_enabled=False))
         expected = process_bgr(image, (10,) * 4, ImageConfig(enabled=False))
         np.testing.assert_array_equal(actual.image, expected.image)
         self.assertEqual(actual.mode, 'legacy')
@@ -150,6 +150,78 @@ class ShadowTests(unittest.TestCase):
         result, field = reduce_soft_shadows(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), ImageConfig())
         self.assertIsNone(field)
         np.testing.assert_array_equal(result, cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+
+class V13RegressionTests(unittest.TestCase):
+    def test_safe_default_disables_perspective(self):
+        cfg = ImageConfig()
+        self.assertFalse(cfg.perspective_enabled)
+        self.assertTrue(cfg.rotation_only)
+        self.assertTrue(cfg.shadow_enabled)
+        self.assertTrue(cfg.contrast_enabled)
+        image = synthetic_book([(200, 120), (610, 95), (555, 510), (230, 535)])
+        result = process_bgr(image, (5,) * 4, ImageConfig(shadow_enabled=False, contrast_enabled=False))
+        self.assertNotEqual(result.mode, 'perspective')
+
+    def test_weak_quad_shadow_is_independent(self):
+        h, w = 420, 680
+        image = np.tile(np.array([236, 232, 226], np.float32), (h, w, 1))
+        image -= np.linspace(0, 70, w, dtype=np.float32)[None, :, None]
+        image = image.astype(np.uint8)
+        fake = BookDetection(None, 0.0, 'none', ('четырёхугольник не подтверждён',))
+        settings = ImageConfig(contrast_enabled=False, line_deskew_enabled=False)
+        with patch('pipeline.detect_book', return_value=(fake, np.zeros((h, w), np.uint8))), \
+             patch('pipeline.legacy_crop', return_value=(None, 'без обрезки')):
+            result = process_bgr(image, (0,) * 4, settings)
+        self.assertIsNotNone(result.image)
+        self.assertEqual(result.mode, 'legacy')
+        self.assertIn('четырёхугольник', result.fallback_reason)
+        self.assertIn('тени', result.reason)
+        self.assertGreater(float(result.image[220, -50, 0]), float(image[220, -50, 0]))
+
+    def test_detector_error_still_corrects_lighting(self):
+        img = np.tile(np.linspace(235, 170, 500, dtype=np.uint8), (400, 1))
+        image = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        with patch('pipeline.detect_book', side_effect=cv2.error('synthetic')), \
+             patch('pipeline.legacy_crop', return_value=(None, 'без обрезки')):
+            result = process_bgr(image, (0,) * 4, ImageConfig(contrast_enabled=False))
+        self.assertIsNotNone(result.image)
+        self.assertIn('ошибка детектора', result.fallback_reason)
+        self.assertGreater(result.image[150, 480, 0], image[150, 480, 0])
+
+    def test_line_deskew_requires_two_parallel_page_edges(self):
+        from deskew import estimate_page_line_angle
+        image = np.full((450, 700, 3), 242, np.uint8)
+        cv2.line(image, (55, 65), (640, 79), (10, 10, 10), 3)
+        cv2.line(image, (55, 315), (640, 329), (12, 12, 12), 3)
+        angle = estimate_page_line_angle(image, ImageConfig())
+        self.assertIsNotNone(angle)
+        self.assertAlmostEqual(angle, 1.37, delta=0.9)
+        cv2.line(image, (55, 315), (640, 329), (242, 242, 242), 6)
+        self.assertIsNone(estimate_page_line_angle(image, ImageConfig()))
+
+    def test_line_deskew_rejects_disagreeing_edges(self):
+        from deskew import estimate_page_line_angle
+        image = np.full((450, 700, 3), 242, np.uint8)
+        cv2.line(image, (55, 65), (640, 78), (10, 10, 10), 3)
+        cv2.line(image, (55, 350), (640, 305), (10, 10, 10), 3)
+        self.assertIsNone(estimate_page_line_angle(image, ImageConfig()))
+
+    def test_contrast_protects_saturated_cover(self):
+        from contrast import enhance_page_contrast
+        image = np.full((330, 420, 3), (232, 230, 224), np.uint8)
+        cv2.putText(image, 'TEXT', (60, 195), cv2.FONT_HERSHEY_SIMPLEX, 1.8,
+                    (95, 95, 95), 2)
+        image[30:130, 270:390] = [160, 70, 35]
+        out, mask = enhance_page_contrast(image, ImageConfig(contrast_strength=0.5))
+        self.assertIsNotNone(mask)
+        np.testing.assert_array_equal(image[60, 300], out[60, 300])
+        self.assertGreater(np.count_nonzero(out != image), 10)
+
+    def test_no_crop_and_no_effect_preserves_bytes(self):
+        image = np.full((300, 400, 3), 245, np.uint8)
+        out = process_bgr(image, (0,) * 4, ImageConfig(deskew_enabled=False))
+        self.assertIsNone(out.image)
 
 
 if __name__ == '__main__':

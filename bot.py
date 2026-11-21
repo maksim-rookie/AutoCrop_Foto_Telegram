@@ -189,7 +189,7 @@ def process_image(payload, name, padding, processing: ImageConfig | None = None)
         raise ValueError('Результат больше 49 MB. Пришлите изображение меньшего размера.')
     caption = (f'Готово: {img.shape[1]}×{img.shape[0]} → {cropped.shape[1]}×{cropped.shape[0]}; '
                f'{transformed.reason}.')
-    if transformed.mode in {'deskew', 'perspective'}:
+    if transformed.mode in {'deskew', 'line_deskew', 'perspective'}:
         caption += f' Режим: {transformed.mode}, confidence={transformed.confidence:.2f}.'
     if transformed.fallback_reason and processing.enabled and img.ndim == 3 and img.shape[2] == 3 and img.dtype == np.uint8:
         caption += ' Безопасный fallback: ' + transformed.fallback_reason + '.'
@@ -325,10 +325,43 @@ def load_processing_config() -> ImageConfig:
         raise ConfigError('Некорректные параметры IMAGE_PROCESSING в config.json.') from None
 
 
+def load_flush_updates_on_start() -> bool:
+    """Read a top-level bool; never expose token or user IDs in errors."""
+    path = Path(__file__).with_name('config.json')
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+        value = data.get('flush_updates_on_start', True)
+        if type(value) is not bool:
+            raise ValueError('expected boolean')
+        return value
+    except (OSError, ValueError, AttributeError, TypeError):
+        raise ConfigError('flush_updates_on_start должен быть true/false в config.json.') from None
+
+
+def initial_update_offset(api: Telegram, flush: bool) -> int:
+    """Discard pre-restart pending updates via negative Telegram getUpdates offset."""
+    if not flush:
+        logging.getLogger(__name__).info('Startup update queue flush disabled')
+        return 0
+    pending = api.call('getUpdates', {'offset': -1, 'limit': 1, 'timeout': 0,
+                                       'allowed_updates': ['message']})
+    if not pending:
+        logging.getLogger(__name__).info('Startup update queue empty')
+        return 0
+    last_id = pending[-1].get('update_id')
+    if type(last_id) is not int or last_id < 0:
+        raise ApiError(category='response')
+    logging.getLogger(__name__).info('Startup update queue discarded (pending last update seen)')
+    return last_id + 1
+
+
 def main():
     try:
         token, ids = load_config()
         image_settings = load_processing_config()
+        flush_updates = load_flush_updates_on_start()
         api = Telegram(token)
         api.call('getMe')
         if api.call('getWebhookInfo').get('url'):
@@ -339,8 +372,8 @@ def main():
         logging.getLogger(__name__).info(
             'Access config: permitted_users=%s source=%s', len(ids), access_source)
         bot = Bot(api, ids, image_settings)
+        offset = initial_update_offset(api, flush_updates)
         print('AutoCrop запущен. Откройте бота и отправьте /start. Остановка: Ctrl+C.')
-        offset = 0
         while True:
             try:
                 updates = api.call('getUpdates', {'offset': offset, 'timeout': 30, 'limit': 10, 'allowed_updates': ['message']})
