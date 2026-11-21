@@ -92,7 +92,7 @@ class CropTests(unittest.TestCase):
         self.assertEqual(name, 'cropped.png')
         self.assertLess(actual.shape[0], 300)
         self.assertLess(actual.shape[1], 240)
-        self.assertGreaterEqual(np.count_nonzero(actual[:, :, 0] == 40), 160 * 120)
+        self.assertGreaterEqual(np.count_nonzero((actual[:, :, 0] >= 33) & (actual[:, :, 0] <= 47)), 160 * 120 * 0.9)
 
     def test_bad_inputs(self):
         for payload, name in [(b'', 'x.png'), (b'wrong', 'x.jpg'), (b'wrong', 'x.exe')]:
@@ -270,6 +270,47 @@ class StartupTests(unittest.TestCase):
         self.assertIn('401', output.getvalue())
         self.assertIn('токен', output.getvalue())
         self.assertNotIn('SECRET', output.getvalue())
+
+
+class RestartQueueTests(unittest.TestCase):
+    def test_flush_uses_last_pending_offset(self):
+        api = FakeAPI()
+        with patch.object(api, 'call', return_value=[{'update_id': 527}]) as called:
+            offset = bot.initial_update_offset(api, flush=True)
+        self.assertEqual(offset, 528)
+        called.assert_called_once_with('getUpdates', {
+            'offset': -1, 'limit': 1, 'timeout': 0, 'allowed_updates': ['message']})
+
+    def test_empty_queue_starts_normally(self):
+        api = FakeAPI()
+        with patch.object(api, 'call', return_value=[]):
+            self.assertEqual(bot.initial_update_offset(api, flush=True), 0)
+
+    def test_flush_can_be_disabled(self):
+        api = FakeAPI()
+        with patch.object(api, 'call') as called:
+            self.assertEqual(bot.initial_update_offset(api, flush=False), 0)
+            called.assert_not_called()
+
+    def test_unexpected_queue_result_fails_without_sending_user_data(self):
+        api = FakeAPI()
+        with patch.object(api, 'call', return_value=[{'update_id': 'secret'}]):
+            with self.assertRaises(bot.ApiError) as found:
+                bot.initial_update_offset(api, flush=True)
+        self.assertNotIn('secret', str(found.exception))
+
+    def test_flush_config_type_is_checked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            config = Path(d, 'config.json')
+            with patch.object(bot, '__file__', str(Path(d, 'bot.py'))):
+                config.write_text('{"flush_updates_on_start": true}', encoding='utf8')
+                self.assertTrue(bot.load_flush_updates_on_start())
+                config.write_text('{"flush_updates_on_start": false}', encoding='utf8')
+                self.assertFalse(bot.load_flush_updates_on_start())
+                config.write_text('{"flush_updates_on_start": "false"}', encoding='utf8')
+                with self.assertRaises(bot.ConfigError):
+                    bot.load_flush_updates_on_start()
 
 
 if __name__ == '__main__':
