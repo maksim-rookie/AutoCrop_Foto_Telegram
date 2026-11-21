@@ -208,7 +208,14 @@ class Bot:
 
     def handle(self, update):
         message = update.get('message')
-        if not message or message.get('chat', {}).get('type') != 'private':
+        if not message:
+            logging.getLogger(__name__).info(
+                'Telegram update=%s ignored: no message', update.get('update_id'))
+            return
+        chat_type = message.get('chat', {}).get('type')
+        if chat_type != 'private':
+            logging.getLogger(__name__).info(
+                'Telegram update=%s ignored: chat_type=%s', update.get('update_id'), chat_type)
             return
         chat_id = message['chat']['id']
         user_id = message.get('from', {}).get('id')
@@ -216,6 +223,13 @@ class Bot:
         words = text.split()
         command = words[0].split('@')[0].lower() if words else ''
         args = words[1:]
+        safe_command = command if command in {
+            '/id', '/start', '/help', '/padding', '/settings', '/reset'
+        } else 'other'
+        logging.getLogger(__name__).info(
+            'Telegram update=%s received: command=%s access=%s',
+            update.get('update_id'), safe_command,
+            'allowed' if user_id in self.allowed_ids else 'denied')
         if command == '/id':
             self.say(chat_id, f'Ваш Telegram ID: {user_id}')
             return
@@ -321,6 +335,9 @@ def main():
             print('У бота включён webhook. Используйте отдельного бота для этой версии или отключите webhook самостоятельно.')
             return 1
         logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+        access_source = 'environment' if os.getenv('ALLOWED_USER_IDS') else 'config.json / prompt'
+        logging.getLogger(__name__).info(
+            'Access config: permitted_users=%s source=%s', len(ids), access_source)
         bot = Bot(api, ids, image_settings)
         print('AutoCrop запущен. Откройте бота и отправьте /start. Остановка: Ctrl+C.')
         offset = 0
