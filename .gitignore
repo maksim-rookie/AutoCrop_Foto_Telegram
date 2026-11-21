@@ -1,0 +1,8 @@
+config.json
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cv_debug/
+cv_debug/
+*.log
