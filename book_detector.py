@@ -113,7 +113,7 @@ def _hough_orientation(edges: np.ndarray, quad: np.ndarray) -> float | None:
         return None
     expected, _ = geometry_metrics(quad)
     angles, weights = [], []
-    for x1, y1, x2, y2 in lines[:, 0]:
+    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):
         length = math.hypot(float(x2 - x1), float(y2 - y1))
         angle = math.degrees(math.atan2(float(y2 - y1), float(x2 - x1)))
         while angle > 90:
