@@ -132,6 +132,24 @@ class HandlerTests(unittest.TestCase):
         self.bot.handle(message(3, document={'file_id': 'abc', 'file_name': 'x.png'}))
         self.assertEqual(self.api.downloads, 0)
 
+    def test_two_allowed_accounts_receive_start_response(self):
+        with self.assertLogs('bot', level='INFO') as captured:
+            self.bot.handle(message(1, text='/start'))
+            self.bot.handle(message(2, text='/start'))
+        self.assertEqual([entry[0] for entry in self.api.calls[-2:]],
+                         ['sendMessage', 'sendMessage'])
+        self.assertEqual([entry[1]['chat_id'] for entry in self.api.calls[-2:]], [1, 2])
+        self.assertTrue(any('access=allowed' in log for log in captured.output))
+        self.assertFalse(any('received: command=/start' in log and '123456789' in log
+                             for log in captured.output))
+
+    def test_denied_account_still_receives_access_message(self):
+        with self.assertLogs('bot', level='INFO') as captured:
+            self.bot.handle(message(3, text='/start'))
+        self.assertEqual(self.api.calls[-1][0], 'sendMessage')
+        self.assertIn('Доступ закрыт', self.api.calls[-1][1]['text'])
+        self.assertTrue(any('access=denied' in log for log in captured.output))
+
     def test_per_user_padding_and_reset(self):
         self.bot.handle(message(text='/padding 1 2 3 4'))
         self.bot.handle(message(2, text='/padding 7,5'))
