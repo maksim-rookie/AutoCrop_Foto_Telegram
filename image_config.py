@@ -13,9 +13,11 @@ class ImageConfig:
 
     enabled: bool = True
     deskew_enabled: bool = True
-    perspective_enabled: bool = True
+    perspective_enabled: bool = False
     shadow_enabled: bool = True
-    rotation_only: bool = False
+    rotation_only: bool = True
+    line_deskew_enabled: bool = True
+    max_line_deskew_degrees: float = 6.0
     analysis_max_side: int = 1400
     min_confidence: float = 0.78
     min_book_area: float = 0.07
@@ -23,7 +25,9 @@ class ImageConfig:
     max_deskew_degrees: float = 18.0
     perspective_threshold: float = 0.075
     max_perspective_stretch: float = 1.35
-    shadow_strength: float = 0.35
+    shadow_strength: float = 0.45
+    contrast_enabled: bool = True
+    contrast_strength: float = 0.22
     shadow_min_variation: float = 12.0
     shadow_clahe_clip: float = 0.0
     debug_dir: str | None = None
@@ -63,6 +67,8 @@ class ImageConfig:
             'perspective_threshold': (0.02, 0.30),
             'max_perspective_stretch': (1.05, 1.70),
             'shadow_strength': (0.0, 1.0),
+            'contrast_strength': (0.0, 1.0),
+            'max_line_deskew_degrees': (0.0, 8.0),
             'shadow_min_variation': (2.0, 80.0),
             'shadow_clahe_clip': (0.0, 2.5),
         }
